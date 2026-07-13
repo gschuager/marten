@@ -53,6 +53,18 @@ public class GapDetectorTest: DaemonContext
     }
 
     [Fact]
+    public async Task detect_gap_if_first_visible_event_is_after_start()
+    {
+        NumberOfStreams = 10;
+        await PublishSingleThreaded();
+        await deleteEvents(1);
+
+        var current = await _runner.Query(theGapDetector, CancellationToken.None);
+
+        current.ShouldBe(0);
+    }
+
+    [Fact]
     public async Task get_max_seq_id_if_no_gap()
     {
         NumberOfStreams = 10;
