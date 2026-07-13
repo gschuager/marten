@@ -543,7 +543,10 @@ public partial class DocumentStore: IEventStore<IDocumentOperations, IQuerySessi
         };;
 
         // Mark the progression
-        await batch.Queue.PostAsync(range.BuildProgressionOperation(Events)).ConfigureAwait(false);
+        if (range.SequenceFloor != range.SequenceCeiling)
+        {
+            await batch.Queue.PostAsync(range.BuildProgressionOperation(Events)).ConfigureAwait(false);
+        }
 
         await using var session = new ProjectionDocumentSession(this, batch,
             new SessionOptions
