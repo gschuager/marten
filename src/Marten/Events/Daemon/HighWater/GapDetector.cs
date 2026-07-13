@@ -23,14 +23,15 @@ internal class GapDetector: ISingleQueryHandler<long?>
         var sql = $@"
 select seq_id
 from   (select
-               seq_id,
-               lead(seq_id)
-               over (order by seq_id) as no
+                seq_id,
+                lead(seq_id)
+                over (order by seq_id) as no
         from
                {_graph.DatabaseSchemaName}.mt_events where seq_id >= :start) ct
 where  no is not null
   and    no - seq_id > 1
 LIMIT 1;
+select min(seq_id) from {_graph.DatabaseSchemaName}.mt_events where seq_id > :start;
 select max(seq_id) from {_graph.DatabaseSchemaName}.mt_events where seq_id >= :start;
 ".Trim();
         var command = new NpgsqlCommand(sql);
@@ -45,6 +46,17 @@ select max(seq_id) from {_graph.DatabaseSchemaName}.mt_events where seq_id >= :s
         if (await reader.ReadAsync(token).ConfigureAwait(false))
         {
             return await reader.GetFieldValueAsync<long>(0, token).ConfigureAwait(false);
+        }
+
+        await reader.NextResultAsync(token).ConfigureAwait(false);
+        if (await reader.ReadAsync(token).ConfigureAwait(false)
+            && !await reader.IsDBNullAsync(0, token).ConfigureAwait(false))
+        {
+            var firstVisible = await reader.GetFieldValueAsync<long>(0, token).ConfigureAwait(false);
+            if (firstVisible > Start + 1)
+            {
+                return Start;
+            }
         }
 
         // use the latest sequence in the event table because there is NO gap

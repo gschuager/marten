@@ -7,6 +7,7 @@ using JasperFx.Events;
 using JasperFx.Events.Daemon;
 using JasperFx.Events.Projections;
 using Marten.Events.Archiving;
+using Marten.Events.Schema;
 using Marten.Exceptions;
 using Marten.Internal.Sessions;
 using Marten.Linq.Selectors;
@@ -36,6 +37,9 @@ internal sealed class EventLoader: IEventLoader
     private readonly int _aggregateIndex;
     private readonly int _batchSize;
     private readonly NpgsqlParameter _ceiling;
+    private readonly NpgsqlParameter _countCeiling;
+    private readonly NpgsqlCommand _countCommand;
+    private readonly NpgsqlParameter _countFloor;
     private readonly NpgsqlCommand _command;
     private readonly NpgsqlParameter _floor;
     private readonly IEventStorage _storage;
@@ -157,6 +161,40 @@ internal sealed class EventLoader: IEventLoader
         builder.Append(_batchSize);
 
         _command = builder.Compile();
+
+        var countBuilder = new CommandBuilder();
+        countBuilder.Append(
+            $"select count(*) from {_schemaName}.mt_events as d inner join {_schemaName}.mt_streams as s on d.stream_id = s.id");
+
+        if (_store.Options.Events.TenancyStyle == TenancyStyle.Conjoined)
+        {
+            countBuilder.Append(" and d.tenant_id = s.tenant_id");
+        }
+
+        if (_store.Options.Events.UseArchivedStreamPartitioning && !includeArchivedEvents)
+        {
+            countBuilder.Append($" and s.{IsArchivedColumn.ColumnName} = FALSE");
+        }
+
+        var countParameters = countBuilder.AppendWithParameters(" where d.seq_id > ? and d.seq_id <= ?");
+        _countFloor = countParameters[0];
+        _countCeiling = countParameters[1];
+        _countFloor.NpgsqlDbType = _countCeiling.NpgsqlDbType = NpgsqlDbType.Bigint;
+
+        if (TenantFilterValue != null)
+        {
+            countBuilder.Append(" and d.tenant_id = '");
+            countBuilder.Append(TenantFilterValue.Replace("'", "''"));
+            countBuilder.Append("'");
+        }
+
+        foreach (var filter in filters)
+        {
+            countBuilder.Append(" and ");
+            filter.Apply(countBuilder);
+        }
+
+        _countCommand = countBuilder.Compile();
         _aggregateIndex = _storage.SelectFields().Length;
     }
 
@@ -289,6 +327,20 @@ internal sealed class EventLoader: IEventLoader
             await reader.CloseAsync().ConfigureAwait(false);
         }
 
+        if (await tryApplyUnrecordedGapCeilingAsync(request.Floor, request.HighWater, page, session, token)
+            .ConfigureAwait(false))
+        {
+            return page;
+        }
+
+        if (await containsNewlyVisibleMatchingEventsAsync(request.Floor, request.HighWater, page.Count + skippedEvents,
+                session, token).ConfigureAwait(false))
+        {
+            var heldPage = new EventPage(request.Floor);
+            heldPage.CalculateCeiling(_batchSize, request.Floor, 0);
+            return heldPage;
+        }
+
         page.CalculateCeiling(_batchSize, request.HighWater, skippedEvents);
 
         // If we got results, reset to normal strategy for next batch
@@ -298,6 +350,154 @@ internal sealed class EventLoader: IEventLoader
         }
 
         return page;
+    }
+
+    private async Task<bool> tryApplyUnrecordedGapCeilingAsync(long floor, long highWater, EventPage page,
+        QuerySession session, CancellationToken token)
+    {
+        var gapCeiling = await findFirstUnrecordedGapCeilingAsync(floor, highWater, session, token)
+            .ConfigureAwait(false);
+        if (!gapCeiling.HasValue)
+        {
+            return false;
+        }
+
+        page.RemoveAll(x => x.Sequence > gapCeiling.Value);
+        page.CalculateCeiling(_batchSize, gapCeiling.Value, 0);
+        return true;
+    }
+
+    private async Task<long?> findFirstUnrecordedGapCeilingAsync(long floor, long highWater, QuerySession session,
+        CancellationToken token)
+    {
+        if (!_store.Options.EventGraph.EnableAdvancedAsyncTracking || highWater <= floor)
+        {
+            return null;
+        }
+
+        var sql = $@"
+with event_rows(seq_id) as (
+    select seq_id from {_schemaName}.mt_events where seq_id > :floor and seq_id <= :ceiling{tenantGapFilter()}
+), visible(seq_id) as (
+    select :floor
+    union all
+    select seq_id from event_rows
+), gaps as (
+    select seq_id, lead(seq_id) over (order by seq_id) as next_seq
+    from visible
+)
+select seq_id
+from gaps
+where next_seq is not null
+  and next_seq - seq_id > 1
+  and not exists (
+      select 1
+      from {_schemaName}.{EventProgressionSkippingTable.Name} skips
+      where skips.starting_sequence = gaps.seq_id
+        and skips.ending_sequence >= gaps.next_seq - 1
+  )
+union all
+select :floor
+where not exists (select 1 from event_rows)
+order by seq_id
+limit 1";
+
+        var command = new NpgsqlCommand(sql);
+        command.AddNamedParameter("floor", floor, NpgsqlDbType.Bigint);
+        command.AddNamedParameter("ceiling", highWater, NpgsqlDbType.Bigint);
+
+        await using var reader = await session.ExecuteReaderAsync(command, token).ConfigureAwait(false);
+        if (await reader.ReadAsync(token).ConfigureAwait(false))
+        {
+            var gapCeiling = await reader.GetFieldValueAsync<long>(0, token).ConfigureAwait(false);
+            await reader.CloseAsync().ConfigureAwait(false);
+            return gapCeiling;
+        }
+
+        await reader.CloseAsync().ConfigureAwait(false);
+        return null;
+    }
+
+    private string tenantGapFilter()
+    {
+        return TenantFilterValue == null ? string.Empty : $" and tenant_id = '{TenantFilterValue.Replace("'", "''")}'";
+    }
+
+    private async Task<bool> containsNewlyVisibleMatchingEventsAsync(long floor, long highWater, int loadedOrSkipped,
+        QuerySession session, CancellationToken token)
+    {
+        if (loadedOrSkipped >= _batchSize)
+        {
+            return false;
+        }
+
+        _countFloor.Value = floor;
+        _countCeiling.Value = highWater;
+
+        await using var reader = await session.ExecuteReaderAsync(_countCommand, token).ConfigureAwait(false);
+        await reader.ReadAsync(token).ConfigureAwait(false);
+        var matchingEventCount = await reader.GetFieldValueAsync<long>(0, token).ConfigureAwait(false);
+        await reader.CloseAsync().ConfigureAwait(false);
+
+        return matchingEventCount > loadedOrSkipped;
+    }
+
+    private async Task<bool> containsUnrecordedLeadingGap(long floor, EventPage page, QuerySession session,
+        CancellationToken token)
+    {
+        return page.Count != 0 && await containsUnrecordedLeadingGap(floor, session, token).ConfigureAwait(false);
+    }
+
+    private async Task<bool> containsUnrecordedLeadingGap(long floor, QuerySession session,
+        CancellationToken token)
+    {
+        if (!_store.Options.EventGraph.EnableAdvancedAsyncTracking)
+        {
+            return false;
+        }
+
+        var minSql = $"select min(seq_id) from {_schemaName}.mt_events where seq_id > :floor";
+        if (TenantFilterValue != null)
+        {
+            minSql += $" and tenant_id = '{TenantFilterValue.Replace("'", "''")}'";
+        }
+
+        var minCommand = new NpgsqlCommand(minSql);
+        minCommand.AddNamedParameter("floor", floor, NpgsqlDbType.Bigint);
+
+        long firstVisibleSequence;
+        await using (var minReader = await session.ExecuteReaderAsync(minCommand, token).ConfigureAwait(false))
+        {
+            await minReader.ReadAsync(token).ConfigureAwait(false);
+            if (await minReader.IsDBNullAsync(0, token).ConfigureAwait(false))
+            {
+                await minReader.CloseAsync().ConfigureAwait(false);
+                return false;
+            }
+
+            firstVisibleSequence = await minReader.GetFieldValueAsync<long>(0, token).ConfigureAwait(false);
+            await minReader.CloseAsync().ConfigureAwait(false);
+        }
+
+        if (firstVisibleSequence <= floor + 1)
+        {
+            return false;
+        }
+
+        var skipSql =
+            $"select count(*) from {_schemaName}.{EventProgressionSkippingTable.Name} where starting_sequence = :floor and ending_sequence >= :ending";
+
+        var command = new NpgsqlCommand(skipSql);
+        command.AddNamedParameter("floor", floor, NpgsqlDbType.Bigint);
+        command.AddNamedParameter("ending", firstVisibleSequence - 1, NpgsqlDbType.Bigint);
+
+        await using var reader = await session.ExecuteReaderAsync(command, token).ConfigureAwait(false);
+
+        await reader.ReadAsync(token).ConfigureAwait(false);
+        var matchingSkipCount = await reader.GetFieldValueAsync<long>(0, token).ConfigureAwait(false);
+        await reader.CloseAsync().ConfigureAwait(false);
+
+        return matchingSkipCount == 0;
     }
 
     // #4744 test seam: drive the skip-ahead MIN probe directly so a regression test can prove
@@ -364,6 +564,13 @@ internal sealed class EventLoader: IEventLoader
             // No matching events at all — return empty page at high water mark
             var emptyPage = new EventPage(request.Floor);
             emptyPage.CalculateCeiling(_batchSize, request.HighWater, 0);
+            return emptyPage;
+        }
+
+        if (await containsUnrecordedLeadingGap(request.Floor, session, token).ConfigureAwait(false))
+        {
+            var emptyPage = new EventPage(request.Floor);
+            emptyPage.CalculateCeiling(_batchSize, request.Floor, 0);
             return emptyPage;
         }
 
@@ -448,6 +655,13 @@ internal sealed class EventLoader: IEventLoader
 
             if (page.Count > 0)
             {
+                if (await containsUnrecordedLeadingGap(request.Floor, page, session, token).ConfigureAwait(false))
+                {
+                    var heldPage = new EventPage(request.Floor);
+                    heldPage.CalculateCeiling(_batchSize, request.Floor, 0);
+                    return heldPage;
+                }
+
                 page.CalculateCeiling(_batchSize, highWater, 0);
                 // Found events — reset strategy for next batch
                 _currentStrategy = LoadStrategy.Normal;

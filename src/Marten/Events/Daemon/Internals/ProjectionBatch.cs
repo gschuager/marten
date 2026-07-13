@@ -32,6 +32,11 @@ internal class ProjectionBatch: IProjectionBatch<IDocumentOperations, IQuerySess
 
     public async ValueTask RecordProgress(EventRange range)
     {
+        if (range.SequenceFloor == range.SequenceCeiling)
+        {
+            return;
+        }
+
         if (range.SequenceFloor == 0)
         {
             await _batch.Queue.PostAsync(new InsertProjectionProgress(((IMartenSession)_session).Options.EventGraph, range)).ConfigureAwait(false);
